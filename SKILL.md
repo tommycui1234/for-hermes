@@ -77,6 +77,40 @@ At the bottom, in the `result` dict returned by `run_conversation()`, add the de
 
 **Why deltas?** A single user turn may involve multiple API calls (tool-calling loops). Session counters are cumulative, so subtracting the baseline gives the true cost of *this request*.
 
+### 1b. Fallback for providers that omit `usage` data
+
+Some providers (notably Chinese endpoints in streaming mode) return `response.usage = None`. Without this fallback, session counters never increment and turn deltas will always be 0.
+
+Find the block in `run_agent.py` that checks `hasattr(response, 'usage') and response.usage:` (usually inside the response handling loop). Insert a rough estimation **before** the existing check:
+
+```python
+                    # Track actual token usage from response for context management
+                    # Some providers (e.g. Chinese endpoints in streaming mode) omit
+                    # usage data. Inject a rough estimate so counters still work.
+                    if not (hasattr(response, 'usage') and response.usage):
+                        from agent.model_metadata import estimate_tokens_rough
+                        _resp_content = ""
+                        if hasattr(response, 'choices') and response.choices:
+                            _msg = response.choices[0].message
+                            _resp_content = getattr(_msg, 'content', '') or ''
+                        _completion = estimate_tokens_rough(_resp_content)
+                        _prompt_texts = []
+                        for m in messages[:-1]:
+                            if isinstance(m, dict):
+                                _prompt_texts.append(m.get('content', '') or '')
+                            elif hasattr(m, 'content'):
+                                _prompt_texts.append(m.content or '')
+                        _prompt = estimate_tokens_rough("\n".join(_prompt_texts))
+                        class _FakeUsage:
+                            prompt_tokens = _prompt
+                            completion_tokens = _completion
+                            total_tokens = _prompt + _completion
+                        response.usage = _FakeUsage()
+
+                    if hasattr(response, 'usage') and response.usage:
+                        # ... existing usage tracking logic ...
+```
+
 ### 2. Add a config gate in `hermes_cli/config.py`
 
 Insert under `DEFAULT_CONFIG["display"]`:
@@ -184,6 +218,7 @@ Then restart the gateway if you use messaging platforms.
 4. **Place the gateway append before the `already_sent` / streaming checks.** Otherwise streaming responses skip the footer entirely.
 5. **Always bump `_config_version`.** Without it, existing user configs will lack the new key and the feature stays off silently.
 6. **Auto-installer idempotency must check ALL patch elements.** If the install script only checks for the first insertion point (e.g., `_turn_start_prompt_tokens`), a partially-patched file from an earlier failed run will be falsely skipped. This can manifest as `turn_prompt_tokens` working but `turn_total_tokens` staying at 0. Verify every patched symbol before returning "already patched".
+7. **Chinese streaming providers may omit `usage` data.** If the token footer consistently shows `📊 Tokens: ↑0 ↓0 | Total: 0`, the provider likely skips `response.usage`. Add the `_FakeUsage` fallback using `estimate_tokens_rough` so the counters remain functional.
 
 ## Testing Checklist
 
