@@ -219,6 +219,7 @@ Then restart the gateway if you use messaging platforms.
 5. **Always bump `_config_version`.** Without it, existing user configs will lack the new key and the feature stays off silently.
 6. **Auto-installer idempotency must check ALL patch elements.** If the install script only checks for the first insertion point (e.g., `_turn_start_prompt_tokens`), a partially-patched file from an earlier failed run will be falsely skipped. This can manifest as `turn_prompt_tokens` working but `turn_total_tokens` staying at 0. Verify every patched symbol before returning "already patched".
 7. **Chinese streaming providers may omit `usage` data.** If the token footer consistently shows `📊 Tokens: ↑0 ↓0 | Total: 0`, the provider likely skips `response.usage`. Add the `_FakeUsage` fallback using `estimate_tokens_rough` so the counters remain functional.
+8. **Auto-installers must use regex, not exact string matching, when patching core files.** Hermes versions differ in indentation, comment wording, and surrounding whitespace. Exact string anchors break silently on other machines, leading to partially-applied patches (e.g., display layer works but token counters stay at 0). Use `re.compile(..., re.MULTILINE)` with flexible whitespace/indentation capture.
 
 ## Testing Checklist
 
