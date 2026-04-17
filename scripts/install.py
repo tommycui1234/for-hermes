@@ -7,6 +7,7 @@ It creates .bak backups before modifying any file.
 
 from __future__ import annotations
 
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -41,15 +42,18 @@ def backup(path: Path) -> Path:
 
 def patch_run_agent(filepath: Path) -> bool:
     text = filepath.read_text()
-    has_turn_deltas = "_turn_start_prompt_tokens" in text and "turn_total_tokens" in text
-    has_fallback = "_FakeUsage" in text or "# Some providers (e.g. Chinese endpoints" in text
+    has_turn_deltas = (
+        "_turn_start_prompt_tokens" in text
+        and "turn_total_tokens" in text
+    )
+    has_fallback = "_FakeUsage" in text or "estimate_tokens_rough(_resp_content)" in text
 
     if has_turn_deltas and has_fallback:
         print("  ✓ run_agent.py already patched")
         return True
 
     # 1. Insert turn start counters after api_call_count = 0
-    if not has_turn_deltas:
+    if not has_turn_deltas and "_turn_start_prompt_tokens" not in text:
         anchor1 = "        api_call_count = 0\n"
         insert1 = (
             "        api_call_count = 0\n"
@@ -77,37 +81,55 @@ def patch_run_agent(filepath: Path) -> bool:
 
     # 3. Insert usage fallback for providers that omit usage data
     if not has_fallback:
-        anchor3 = "                    # Track actual token usage from response for context management\n                    if hasattr(response, 'usage') and response.usage:\n"
-        insert3 = (
-            "                    # Track actual token usage from response for context management\n"
-            "                    # Some providers (e.g. Chinese endpoints in streaming mode) omit\n"
-            "                    # usage data. Inject a rough estimate so counters still work.\n"
-            "                    if not (hasattr(response, 'usage') and response.usage):\n"
-            "                        from agent.model_metadata import estimate_tokens_rough\n"
-            "                        _resp_content = \"\"\n"
-            "                        if hasattr(response, 'choices') and response.choices:\n"
-            "                            _msg = response.choices[0].message\n"
-            "                            _resp_content = getattr(_msg, 'content', '') or ''\n"
-            "                        _completion = estimate_tokens_rough(_resp_content)\n"
-            "                        _prompt_texts = []\n"
-            "                        for m in messages[:-1]:\n"
-            "                            if isinstance(m, dict):\n"
-            "                                _prompt_texts.append(m.get('content', '') or '')\n"
-            "                            elif hasattr(m, 'content'):\n"
-            "                                _prompt_texts.append(m.content or '')\n"
-            '                        _prompt = estimate_tokens_rough("\\n".join(_prompt_texts))\n'
-            "                        class _FakeUsage:\n"
-            "                            prompt_tokens = _prompt\n"
-            "                            completion_tokens = _completion\n"
-            "                            total_tokens = _prompt + _completion\n"
-            "                        response.usage = _FakeUsage()\n"
-            "\n"
-            "                    if hasattr(response, 'usage') and response.usage:\n"
+        # Try robust regex matching first (handles varying indentation)
+        pattern = re.compile(
+            r'^(\s*)(#\s*Track actual token usage from response for context management\s*\n)'
+            r'^\1if\s+hasattr\(\s*response\s*,\s*[\'"]usage[\'"]\s*\)\s+and\s+response\.usage\s*:\s*$',
+            re.MULTILINE,
         )
-        if anchor3 not in text:
-            print("  ✗ Could not find anchor 'Track actual token usage' in run_agent.py")
-            return False
-        text = text.replace(anchor3, insert3, 1)
+        match = pattern.search(text)
+        if match:
+            indent = match.group(1)
+            insert_pos = match.start()
+        else:
+            # Fallback: search just the if line with any indentation
+            pattern2 = re.compile(
+                r'^(\s*)if\s+hasattr\(\s*response\s*,\s*[\'"]usage[\'"]\s*\)\s+and\s+response\.usage\s*:\s*$',
+                re.MULTILINE,
+            )
+            match2 = pattern2.search(text)
+            if match2:
+                indent = match2.group(1)
+                insert_pos = match2.start()
+            else:
+                print("  ✗ Could not find anchor 'if hasattr(response, 'usage') and response.usage:' in run_agent.py")
+                return False
+
+        fallback_code = (
+            f"{indent}# Some providers (e.g. Chinese endpoints in streaming mode) omit\n"
+            f"{indent}# usage data. Inject a rough estimate so counters still work.\n"
+            f"{indent}if not (hasattr(response, 'usage') and response.usage):\n"
+            f"{indent}    from agent.model_metadata import estimate_tokens_rough\n"
+            f'{indent}    _resp_content = ""\n'
+            f"{indent}    if hasattr(response, 'choices') and response.choices:\n"
+            f"{indent}        _msg = response.choices[0].message\n"
+            f"{indent}        _resp_content = getattr(_msg, 'content', '') or ''\n"
+            f"{indent}    _completion = estimate_tokens_rough(_resp_content)\n"
+            f"{indent}    _prompt_texts = []\n"
+            f"{indent}    for m in messages[:-1]:\n"
+            f"{indent}        if isinstance(m, dict):\n"
+            f"{indent}            _prompt_texts.append(m.get('content', '') or '')\n"
+            f"{indent}        elif hasattr(m, 'content'):\n"
+            f"{indent}            _prompt_texts.append(m.content or '')\n"
+            f'{indent}    _prompt = estimate_tokens_rough("\\n".join(_prompt_texts))\n'
+            f"{indent}    class _FakeUsage:\n"
+            f"{indent}        prompt_tokens = _prompt\n"
+            f"{indent}        completion_tokens = _completion\n"
+            f"{indent}        total_tokens = _prompt + _completion\n"
+            f"{indent}    response.usage = _FakeUsage()\n"
+            f"\n"
+        )
+        text = text[:insert_pos] + fallback_code + text[insert_pos:]
 
     backup(filepath)
     filepath.write_text(text)
@@ -199,10 +221,6 @@ def patch_cli(filepath: Path) -> bool:
         print("  ! Could not find token streaming anchor in cli.py (skipping)")
 
     # 2c. Non-streaming: add footer to Panel
-    anchor2c = '                        _rich_text_from_ansi(response),\n'
-    insert2c = '                        _rich_text_from_ansi(response + _token_footer),\n'
-    # We need to target the specific Panel inside the response block.
-    # A safer anchor is the surrounding Panel call.
     anchor2c_alt = (
         "                    _chat_console.print(Panel(\n"
         "                        _rich_text_from_ansi(response),\n"
@@ -225,92 +243,83 @@ def patch_cli(filepath: Path) -> bool:
 
 def patch_gateway(filepath: Path) -> bool:
     text = filepath.read_text()
-    if "_rds_token" in text:
+    if "_token_footer" in text and "turn_prompt_tokens" in text:
         print("  ✓ gateway/run.py already patched")
         return True
 
-    # Insert footer logic before the streaming media block
-    anchor = (
-        "            # If streaming already delivered the response, extract and\n"
-        "            # deliver any MEDIA: files before returning None.  Streaming\n"
-    )
-    insert = (
-        "            # Append token usage footer if enabled (before streaming check so\n"
-        "            # non-streaming responses include it without affecting TTS).\n"
-        "            _token_footer = \"\"\n"
-        "            if response:\n"
-        "                try:\n"
-        "                    from gateway.display_config import resolve_display_setting as _rds_token\n"
-        "                    _show_tokens = _rds_token(\n"
-        "                        _load_gateway_config(),\n"
-        "                        _platform_config_key(source.platform),\n"
+    # 1. Insert footer builder after response = agent_result.get("final_response") or ""
+    anchor1 = '            response = agent_result.get("final_response") or ""\n'
+    insert1 = (
+        '            response = agent_result.get("final_response") or ""\n\n'
+        '            # Append token usage footer if enabled (before streaming check so\n'
+        '            # non-streaming responses include it without affecting TTS).\n'
+        '            _token_footer = ""\n'
+        '            if response:\n'
+        '                try:\n'
+        '                    from gateway.display_config import resolve_display_setting as _rds_token\n'
+        '                    _show_tokens = _rds_token(\n'
+        '                        _load_gateway_config(),\n'
+        '                        _platform_config_key(source.platform),\n'
         '                        "show_token_usage",\n'
-        "                        False,\n"
-        "                    )\n"
+        '                        False,\n'
+        '                    )\n'
         '                    logger.debug("token footer _show_tokens=%s for platform=%s", _show_tokens, source.platform)\n'
-        "                    if _show_tokens:\n"
+        '                    if _show_tokens:\n'
         '                        _t_in = agent_result.get("turn_prompt_tokens", 0)\n'
         '                        _t_out = agent_result.get("turn_completion_tokens", 0)\n'
         '                        _t_total = agent_result.get("turn_total_tokens", 0)\n'
         '                        _t_model = agent_result.get("model", "unknown")\n'
         '                        _token_footer = f"\\n\\n---\\n*📊 Tokens: ↑{_t_in:,} ↓{_t_out:,} | Total: {_t_total:,} | Model: {_t_model}*"\n'
-        "                        response += _token_footer\n"
+        '                        response += _token_footer\n'
         '                        logger.debug("token footer appended: %s", _token_footer)\n'
-        "                except Exception as _token_footer_err:\n"
+        '                except Exception as _token_footer_err:\n'
         '                    logger.debug("token footer append failed: %s", _token_footer_err)\n'
-        "\n"
-        "            # If streaming already delivered the response, extract and\n"
-        "            # deliver any MEDIA: files before returning None.  Streaming\n"
     )
-    if anchor not in text:
-        print("  ✗ Could not find streaming-media anchor in gateway/run.py")
+    if anchor1 not in text:
+        print("  ✗ Could not find anchor 'response = agent_result.get(\"final_response\")' in gateway/run.py")
         return False
-    text = text.replace(anchor, insert, 1)
+    text = text.replace(anchor1, insert1, 1)
 
-    # Insert footer follow-up inside the already_sent block
+    # 2. Insert footer follow-up inside the already_sent block before return None
     anchor2 = (
+        "            if agent_result.get(\"already_sent\") and not agent_result.get(\"failed\"):\n"
+        "                if response:\n"
+        "                    _media_adapter = self.adapters.get(source.platform)\n"
+        "                    if _media_adapter:\n"
+        "                        await self._deliver_media_from_response(\n"
+        "                            response, event, _media_adapter,\n"
+        "                        )\n"
+        "                return None\n"
+    )
+    insert2 = (
+        "            if agent_result.get(\"already_sent\") and not agent_result.get(\"failed\"):\n"
+        "                if response:\n"
+        "                    _media_adapter = self.adapters.get(source.platform)\n"
+        "                    if _media_adapter:\n"
+        "                        await self._deliver_media_from_response(\n"
+        "                            response, event, _media_adapter,\n"
+        "                        )\n"
         "                    # Streaming already delivered the main text; send the\n"
         "                    # token footer as a separate follow-up message so it\n"
         "                    # still appears at the end of the reply.\n"
+        "                    if _token_footer:\n"
+        "                        _footer_adapter = self.adapters.get(source.platform)\n"
+        "                        if _footer_adapter:\n"
+        "                            try:\n"
+        '                                _thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None\n'
+        "                                await _footer_adapter.send(\n"
+        "                                    event.source.chat_id,\n"
+        "                                    _token_footer,\n"
+        "                                    metadata=_thread_meta,\n"
+        "                                )\n"
+        "                            except Exception:\n"
+        "                                pass\n"
+        "                return None\n"
     )
-    # If this section already exists, skip. Otherwise add it.
-    if anchor2 not in text:
-        anchor2_target = (
-            "                    # Streaming already delivered the main text; send the\n"
-            "                    # reasoning separately so it still appears at the end.\n"
-        )
-        # There may not be a reasoning section; try another anchor.
-        anchor2_target_alt = (
-            "                if response:\n"
-            "                    _media_adapter = self.adapters.get(source.platform)\n"
-        )
-        insert2 = (
-            "                if response:\n"
-            "                    _media_adapter = self.adapters.get(source.platform)\n"
-            "                    if _media_adapter:\n"
-            "                        await self._deliver_media_from_response(\n"
-            "                            response, event, _media_adapter,\n"
-            "                        )\n"
-            "                    # Streaming already delivered the main text; send the\n"
-            "                    # token footer as a separate follow-up message so it\n"
-            "                    # still appears at the end of the reply.\n"
-            "                    if _token_footer:\n"
-            "                        _footer_adapter = self.adapters.get(source.platform)\n"
-            "                        if _footer_adapter:\n"
-            "                            try:\n"
-            '                                _thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None\n'
-            "                                await _footer_adapter.send(\n"
-            "                                    event.source.chat_id,\n"
-            "                                    _token_footer,\n"
-            "                                    metadata=_thread_meta,\n"
-            "                                )\n"
-            "                            except Exception:\n"
-            "                                pass\n"
-        )
-        if anchor2_target_alt in text:
-            text = text.replace(anchor2_target_alt, insert2, 1)
-        else:
-            print("  ! Could not find already_sent media anchor in gateway/run.py (footer follow-up skipped)")
+    if anchor2 in text:
+        text = text.replace(anchor2, insert2, 1)
+    else:
+        print("  ! Could not find already_sent block in gateway/run.py (footer follow-up skipped)")
 
     backup(filepath)
     filepath.write_text(text)
@@ -325,7 +334,6 @@ def patch_display_config(filepath: Path) -> bool:
         print("  ✓ gateway/display_config.py already patched")
         return True
 
-    # Insert into _GLOBAL_DEFAULTS
     anchor = '    "streaming": None,  # None = follow top-level streaming config\n'
     insert = '    "show_token_usage": False,\n'
     if anchor not in text:
@@ -335,18 +343,13 @@ def patch_display_config(filepath: Path) -> bool:
     backup(filepath)
     text = text.replace(anchor, anchor + insert, 1)
 
-    # Also insert into tier dicts
     for tier in ("_TIER_HIGH", "_TIER_MEDIUM", "_TIER_LOW", "_TIER_MINIMAL"):
-        anchor_tier = f"{tier} = {{\n"
-        if anchor_tier in text and '"show_token_usage"' not in text.split(anchor_tier, 1)[1].split("\n}", 1)[0]:
-            # Find the last line before the closing brace in this tier block
-            # Simpler: insert after streaming line in each tier
-            tier_anchor = f'        "streaming": None,  # follow global\n'
-            tier_insert = '        "show_token_usage": False,\n'
-            # We must be careful to only replace inside the specific tier.
-            # Since tiers are sequential, we can use a limit of 1 per tier.
-            parts = text.split(tier_anchor, 1)
-            if len(parts) == 2:
+        tier_anchor = f'        "streaming": None,  # follow global\n'
+        tier_insert = '        "show_token_usage": False,\n'
+        parts = text.split(tier_anchor, 1)
+        if len(parts) == 2:
+            tier_block = parts[1].split("\n}", 1)[0]
+            if '"show_token_usage"' not in tier_block:
                 text = parts[0] + tier_anchor + tier_insert + tier_anchor.join(parts[1:])
 
     filepath.write_text(text)
