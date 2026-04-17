@@ -41,35 +41,73 @@ def backup(path: Path) -> Path:
 
 def patch_run_agent(filepath: Path) -> bool:
     text = filepath.read_text()
-    if "_turn_start_prompt_tokens" in text and "turn_total_tokens" in text:
+    has_turn_deltas = "_turn_start_prompt_tokens" in text and "turn_total_tokens" in text
+    has_fallback = "_FakeUsage" in text or "# Some providers (e.g. Chinese endpoints" in text
+
+    if has_turn_deltas and has_fallback:
         print("  ✓ run_agent.py already patched")
         return True
 
     # 1. Insert turn start counters after api_call_count = 0
-    anchor1 = "        api_call_count = 0\n"
-    insert1 = (
-        "        api_call_count = 0\n"
-        "        _turn_start_prompt_tokens = self.session_prompt_tokens\n"
-        "        _turn_start_completion_tokens = self.session_completion_tokens\n"
-        "        _turn_start_total_tokens = self.session_total_tokens\n"
-    )
-    if anchor1 not in text:
-        print("  ✗ Could not find anchor 'api_call_count = 0' in run_agent.py")
-        return False
-    text = text.replace(anchor1, insert1, 1)
+    if not has_turn_deltas:
+        anchor1 = "        api_call_count = 0\n"
+        insert1 = (
+            "        api_call_count = 0\n"
+            "        _turn_start_prompt_tokens = self.session_prompt_tokens\n"
+            "        _turn_start_completion_tokens = self.session_completion_tokens\n"
+            "        _turn_start_total_tokens = self.session_total_tokens\n"
+        )
+        if anchor1 not in text:
+            print("  ✗ Could not find anchor 'api_call_count = 0' in run_agent.py")
+            return False
+        text = text.replace(anchor1, insert1, 1)
 
-    # 2. Insert turn deltas into the result dict
-    anchor2 = '            "total_tokens": self.session_total_tokens,\n'
-    insert2 = (
-        '            "total_tokens": self.session_total_tokens,\n'
-        '            "turn_prompt_tokens": self.session_prompt_tokens - _turn_start_prompt_tokens,\n'
-        '            "turn_completion_tokens": self.session_completion_tokens - _turn_start_completion_tokens,\n'
-        '            "turn_total_tokens": self.session_total_tokens - _turn_start_total_tokens,\n'
-    )
-    if anchor2 not in text:
-        print("  ✗ Could not find anchor 'total_tokens' result dict in run_agent.py")
-        return False
-    text = text.replace(anchor2, insert2, 1)
+        # 2. Insert turn deltas into the result dict
+        anchor2 = '            "total_tokens": self.session_total_tokens,\n'
+        insert2 = (
+            '            "total_tokens": self.session_total_tokens,\n'
+            '            "turn_prompt_tokens": self.session_prompt_tokens - _turn_start_prompt_tokens,\n'
+            '            "turn_completion_tokens": self.session_completion_tokens - _turn_start_completion_tokens,\n'
+            '            "turn_total_tokens": self.session_total_tokens - _turn_start_total_tokens,\n'
+        )
+        if anchor2 not in text:
+            print("  ✗ Could not find anchor 'total_tokens' result dict in run_agent.py")
+            return False
+        text = text.replace(anchor2, insert2, 1)
+
+    # 3. Insert usage fallback for providers that omit usage data
+    if not has_fallback:
+        anchor3 = "                    # Track actual token usage from response for context management\n                    if hasattr(response, 'usage') and response.usage:\n"
+        insert3 = (
+            "                    # Track actual token usage from response for context management\n"
+            "                    # Some providers (e.g. Chinese endpoints in streaming mode) omit\n"
+            "                    # usage data. Inject a rough estimate so counters still work.\n"
+            "                    if not (hasattr(response, 'usage') and response.usage):\n"
+            "                        from agent.model_metadata import estimate_tokens_rough\n"
+            "                        _resp_content = \"\"\n"
+            "                        if hasattr(response, 'choices') and response.choices:\n"
+            "                            _msg = response.choices[0].message\n"
+            "                            _resp_content = getattr(_msg, 'content', '') or ''\n"
+            "                        _completion = estimate_tokens_rough(_resp_content)\n"
+            "                        _prompt_texts = []\n"
+            "                        for m in messages[:-1]:\n"
+            "                            if isinstance(m, dict):\n"
+            "                                _prompt_texts.append(m.get('content', '') or '')\n"
+            "                            elif hasattr(m, 'content'):\n"
+            "                                _prompt_texts.append(m.content or '')\n"
+            '                        _prompt = estimate_tokens_rough("\\n".join(_prompt_texts))\n'
+            "                        class _FakeUsage:\n"
+            "                            prompt_tokens = _prompt\n"
+            "                            completion_tokens = _completion\n"
+            "                            total_tokens = _prompt + _completion\n"
+            "                        response.usage = _FakeUsage()\n"
+            "\n"
+            "                    if hasattr(response, 'usage') and response.usage:\n"
+        )
+        if anchor3 not in text:
+            print("  ✗ Could not find anchor 'Track actual token usage' in run_agent.py")
+            return False
+        text = text.replace(anchor3, insert3, 1)
 
     backup(filepath)
     filepath.write_text(text)
