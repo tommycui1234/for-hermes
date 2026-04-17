@@ -183,6 +183,7 @@ Then restart the gateway if you use messaging platforms.
 3. **Gateway per-platform overrides require `resolve_display_setting`.** Do not read the global config key directly; that ignores `display.platforms.<platform>` overrides.
 4. **Place the gateway append before the `already_sent` / streaming checks.** Otherwise streaming responses skip the footer entirely.
 5. **Always bump `_config_version`.** Without it, existing user configs will lack the new key and the feature stays off silently.
+6. **Auto-installer idempotency must check ALL patch elements.** If the install script only checks for the first insertion point (e.g., `_turn_start_prompt_tokens`), a partially-patched file from an earlier failed run will be falsely skipped. This can manifest as `turn_prompt_tokens` working but `turn_total_tokens` staying at 0. Verify every patched symbol before returning "already patched".
 
 ## Testing Checklist
 
