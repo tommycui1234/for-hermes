@@ -41,7 +41,7 @@ def backup(path: Path) -> Path:
 
 def patch_run_agent(filepath: Path) -> bool:
     text = filepath.read_text()
-    if "_turn_start_prompt_tokens" in text:
+    if "_turn_start_prompt_tokens" in text and "turn_total_tokens" in text:
         print("  ✓ run_agent.py already patched")
         return True
 
